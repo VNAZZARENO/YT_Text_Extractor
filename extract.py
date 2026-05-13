@@ -28,24 +28,11 @@ def slugify(name: str, max_len: int = 80) -> str:
     return cleaned[:max_len]
 
 
-def fetch_subtitles(
-    url: str,
-    lang: str,
-    outdir: Path,
-    cookies_browser: str | None = None,
-) -> tuple[dict, Path | None]:
-    """Download subtitles (manual preferred, else auto) and return info + path."""
+def _build_ydl_opts(cookies_browser: str | None, extra: dict | None = None) -> dict:
     opts = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": [lang, f"{lang}.*", "en", "en.*"],
-        "subtitlesformat": "vtt",
-        "outtmpl": str(outdir / "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        # Retry/backoff to absorb transient 429s from YouTube.
         "retries": 10,
         "extractor_retries": 10,
         "fragment_retries": 10,
@@ -54,37 +41,108 @@ def fetch_subtitles(
             "fragment": lambda n: min(2 ** n, 60),
             "extractor": lambda n: min(2 ** n, 60),
         },
-        "sleep_interval_subtitles": 1,
     }
     if cookies_browser:
         opts["cookiesfrombrowser"] = (cookies_browser,)
+    if extra:
+        opts.update(extra)
+    return opts
 
-    def _run() -> dict:
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=True)
+
+def _run_with_cookie_fallback(opts: dict, url: str, *, download: bool) -> dict:
+    """Run yt-dlp, retrying without browser cookies if the cookie jar is unreadable."""
+    def _run(o: dict) -> dict:
+        with YoutubeDL(o) as ydl:
+            return ydl.extract_info(url, download=download)
 
     try:
-        info = _run()
+        return _run(opts)
     except Exception as e:
-        # If the browser cookie jar is locked/unreadable, retry without it.
         msg = str(e).lower()
         cookie_failure = any(k in msg for k in ("cookie", "secretstorage", "keyring", "browser"))
-        if cookies_browser and cookie_failure:
+        if "cookiesfrombrowser" in opts and cookie_failure:
             opts.pop("cookiesfrombrowser", None)
-            info = _run()
-        else:
-            raise
+            return _run(opts)
+        raise
+
+
+def probe_video(url: str, cookies_browser: str | None = None) -> dict:
+    """Fetch video metadata (including available subtitle tracks) without downloading."""
+    opts = _build_ydl_opts(cookies_browser, {"skip_download": True})
+    return _run_with_cookie_fallback(opts, url, download=False)
+
+
+def pick_subtitle_lang(info: dict, preferred: str | None) -> str:
+    """Choose the best subtitle language.
+
+    Priority:
+      1. Explicit --lang from the user.
+      2. The video's declared language (info.language) if subs exist for it.
+      3. The first manual subtitle track available.
+      4. The first automatic caption track available.
+      5. Fallback to "en".
+    """
+    manual = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+
+    def has_track(lang_code: str) -> bool:
+        if not lang_code:
+            return False
+        prefix = lang_code.split("-")[0].lower()
+        for key in list(manual.keys()) + list(auto.keys()):
+            if key.lower() == prefix or key.lower().startswith(prefix + "-"):
+                return True
+        return False
+
+    if preferred:
+        return preferred
+
+    declared = (info.get("language") or "").lower()
+    if has_track(declared):
+        return declared.split("-")[0]
+
+    if manual:
+        return next(iter(manual.keys())).split("-")[0]
+    if auto:
+        return next(iter(auto.keys())).split("-")[0]
+    return "en"
+
+
+def fetch_subtitles(
+    url: str,
+    lang: str,
+    outdir: Path,
+    cookies_browser: str | None = None,
+) -> tuple[dict, Path | None]:
+    """Download subtitles in the chosen language (manual preferred, else auto)."""
+    # Restrict to the exact requested language family. We deliberately do NOT
+    # fall back to other languages here: if French is requested but not present,
+    # we'd rather report "missing" than silently grab an auto-translated track.
+    opts = _build_ydl_opts(
+        cookies_browser,
+        {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [lang, f"{lang}.*", f"{lang}-orig"],
+            "subtitlesformat": "vtt",
+            "outtmpl": str(outdir / "%(id)s.%(ext)s"),
+            "sleep_interval_subtitles": 1,
+        },
+    )
+
+    info = _run_with_cookie_fallback(opts, url, download=True)
 
     video_id = info["id"]
-    # Look for any matching VTT file in outdir
     candidates = sorted(outdir.glob(f"{video_id}*.vtt"))
     if not candidates:
         return info, None
 
-    # Prefer manual subs over auto: yt-dlp names auto as .<lang>.vtt too,
-    # but manual subs are written first if both available. Take the first.
+    # Prefer manual over auto: manual file is `<id>.<lang>.vtt`,
+    # auto-generated is `<id>.<lang>.vtt` too but written second when both exist.
+    # If only auto is present, yt-dlp writes it under the same name pattern.
     for c in candidates:
-        if lang in c.name:
+        if f".{lang}." in c.name or c.name.endswith(f".{lang}.vtt"):
             return info, c
     return info, candidates[0]
 
@@ -155,7 +213,11 @@ def parse_vtt(path: Path) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Extract clean YouTube transcript text.")
     ap.add_argument("url", help="YouTube video URL")
-    ap.add_argument("--lang", default="en", help="Preferred subtitle language (default: en)")
+    ap.add_argument(
+        "--lang",
+        default=None,
+        help="Preferred subtitle language (e.g. fr, en). If omitted, auto-detect from the video.",
+    )
     ap.add_argument(
         "--root",
         default=str(DEFAULT_ROOT),
@@ -171,16 +233,28 @@ def main() -> int:
 
     cookies_browser = None if args.cookies_from_browser.lower() == "none" else args.cookies_from_browser
 
+    try:
+        probe = probe_video(args.url, cookies_browser)
+    except Exception as e:
+        print(f"Error probing video metadata: {e}", file=sys.stderr)
+        return 1
+
+    chosen_lang = pick_subtitle_lang(probe, args.lang)
+    print(f"Subtitle language: {chosen_lang}", file=sys.stderr)
+
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         try:
-            info, vtt = fetch_subtitles(args.url, args.lang, tmpdir, cookies_browser)
+            info, vtt = fetch_subtitles(args.url, chosen_lang, tmpdir, cookies_browser)
         except Exception as e:
             print(f"Error fetching subtitles: {e}", file=sys.stderr)
             return 1
 
         if vtt is None:
-            print("No subtitles (manual or auto) available for this video.", file=sys.stderr)
+            print(
+                f"No '{chosen_lang}' subtitles (manual or auto) available for this video.",
+                file=sys.stderr,
+            )
             return 2
 
         body = parse_vtt(vtt)
@@ -220,7 +294,8 @@ def main() -> int:
                 "url": webpage_url,
                 "upload_date": info.get("upload_date"),
                 "view_count": info.get("view_count"),
-                "language": info.get("language") or args.lang,
+                "language": info.get("language") or chosen_lang,
+                "subtitle_language": chosen_lang,
             },
             indent=2,
             ensure_ascii=False,
