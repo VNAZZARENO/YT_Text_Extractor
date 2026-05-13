@@ -28,7 +28,12 @@ def slugify(name: str, max_len: int = 80) -> str:
     return cleaned[:max_len]
 
 
-def fetch_subtitles(url: str, lang: str, outdir: Path) -> tuple[dict, Path | None]:
+def fetch_subtitles(
+    url: str,
+    lang: str,
+    outdir: Path,
+    cookies_browser: str | None = None,
+) -> tuple[dict, Path | None]:
     """Download subtitles (manual preferred, else auto) and return info + path."""
     opts = {
         "skip_download": True,
@@ -40,9 +45,35 @@ def fetch_subtitles(url: str, lang: str, outdir: Path) -> tuple[dict, Path | Non
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        # Retry/backoff to absorb transient 429s from YouTube.
+        "retries": 10,
+        "extractor_retries": 10,
+        "fragment_retries": 10,
+        "retry_sleep_functions": {
+            "http": lambda n: min(2 ** n, 60),
+            "fragment": lambda n: min(2 ** n, 60),
+            "extractor": lambda n: min(2 ** n, 60),
+        },
+        "sleep_interval_subtitles": 1,
     }
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    if cookies_browser:
+        opts["cookiesfrombrowser"] = (cookies_browser,)
+
+    def _run() -> dict:
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    try:
+        info = _run()
+    except Exception as e:
+        # If the browser cookie jar is locked/unreadable, retry without it.
+        msg = str(e).lower()
+        cookie_failure = any(k in msg for k in ("cookie", "secretstorage", "keyring", "browser"))
+        if cookies_browser and cookie_failure:
+            opts.pop("cookiesfrombrowser", None)
+            info = _run()
+        else:
+            raise
 
     video_id = info["id"]
     # Look for any matching VTT file in outdir
@@ -131,12 +162,19 @@ def main() -> int:
         help=f"Root directory for organized output (default: {DEFAULT_ROOT})",
     )
     ap.add_argument("--stdout", action="store_true", help="Also print transcript to stdout")
+    ap.add_argument(
+        "--cookies-from-browser",
+        default="chrome",
+        help="Browser to load cookies from (chrome, firefox, brave, edge, ...) or 'none' to disable. Helps avoid 429s.",
+    )
     args = ap.parse_args()
+
+    cookies_browser = None if args.cookies_from_browser.lower() == "none" else args.cookies_from_browser
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         try:
-            info, vtt = fetch_subtitles(args.url, args.lang, tmpdir)
+            info, vtt = fetch_subtitles(args.url, args.lang, tmpdir, cookies_browser)
         except Exception as e:
             print(f"Error fetching subtitles: {e}", file=sys.stderr)
             return 1
