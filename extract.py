@@ -5,6 +5,7 @@ import argparse
 import html
 import json
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -14,6 +15,15 @@ from yt_dlp import YoutubeDL
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT = SCRIPT_DIR / "transcripts"
+
+
+def _detect_js_runtime() -> dict | None:
+    """Find a JS runtime (deno or node) yt-dlp can use for YouTube extraction."""
+    for name in ("deno", "node"):
+        path = shutil.which(name)
+        if path:
+            return {name: {"path": path}}
+    return None
 
 
 def slugify(name: str, max_len: int = 80) -> str:
@@ -42,6 +52,9 @@ def _build_ydl_opts(cookies_browser: str | None, extra: dict | None = None) -> d
             "extractor": lambda n: min(2 ** n, 60),
         },
     }
+    runtime = _detect_js_runtime()
+    if runtime:
+        opts["js_runtimes"] = runtime
     if cookies_browser:
         opts["cookiesfrombrowser"] = (cookies_browser,)
     if extra:
