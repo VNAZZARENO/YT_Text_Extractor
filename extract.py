@@ -63,7 +63,13 @@ def _build_ydl_opts(cookies_browser: str | None, extra: dict | None = None) -> d
 
 
 def _run_with_cookie_fallback(opts: dict, url: str, *, download: bool) -> dict:
-    """Run yt-dlp, retrying without browser cookies if the cookie jar is unreadable."""
+    """Run yt-dlp, retrying without browser cookies if the first attempt fails.
+
+    Cookie-jar failures surface with unpredictable messages (e.g. the GNOME
+    keyring raises "Item does not exist!"), so no keyword list is reliable.
+    Retrying without cookies is safe: a genuine error fails the same way
+    on the retry and still propagates.
+    """
     def _run(o: dict) -> dict:
         with YoutubeDL(o) as ydl:
             return ydl.extract_info(url, download=download)
@@ -71,12 +77,14 @@ def _run_with_cookie_fallback(opts: dict, url: str, *, download: bool) -> dict:
     try:
         return _run(opts)
     except Exception as e:
-        msg = str(e).lower()
-        cookie_failure = any(k in msg for k in ("cookie", "secretstorage", "keyring", "browser"))
-        if "cookiesfrombrowser" in opts and cookie_failure:
-            opts.pop("cookiesfrombrowser", None)
-            return _run(opts)
-        raise
+        if "cookiesfrombrowser" not in opts:
+            raise
+        print(
+            f"yt-dlp failed with browser cookies ({e}); retrying without cookies",
+            file=sys.stderr,
+        )
+        opts.pop("cookiesfrombrowser", None)
+        return _run(opts)
 
 
 def probe_video(url: str, cookies_browser: str | None = None) -> dict:
